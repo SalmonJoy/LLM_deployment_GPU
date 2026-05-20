@@ -1117,3 +1117,401 @@ Appendix B. The findings worth remembering as lessons:
 The benchmark script is preserved at `/tmp/benchmark.py` on `GPU-1`
 (wiped on each deallocate; regenerate from the heredoc that produced
 it). Output snapshot at `/tmp/benchmark_output.txt`.
+
+---
+
+## Appendix C — The vLLM migration (2026-05-19)
+
+After Appendix B's benchmark established that local Ollama beat Ollama
+Cloud at single-user but lost at high concurrency (the crossover at
+N≈2), the obvious next question was: can we close the concurrency gap
+without giving up the single-user win?
+
+The answer turned out to be yes — by replacing Ollama with vLLM for
+gpt-oss-120b specifically. The migration took ~3 hours and the
+benchmark improvement was dramatic.
+
+### What we changed
+
+Just the gpt-oss path. Everything else stayed on Ollama (mistral,
+translategemma, glm-ocr, the three embedding models). The hybrid
+architecture worked exactly as expected:
+
+```
+Before:                          After:
+client → wrapper :11434          client → wrapper :11434
+    → Ollama Cloud (for             → vLLM :8001 (for gpt-oss, local)
+       gpt-oss)                     → Ollama :11433 (for everything else)
+    → Ollama :11433 (others)
+```
+
+(The wrapper routing change is still pending — for now the wrapper
+still goes to cloud and benchmark traffic hits port 8001 directly.)
+
+### Why vLLM, not just `OLLAMA_NUM_PARALLEL` bump
+
+`OLLAMA_NUM_PARALLEL=4` would have given Ollama 4 concurrent slots,
+but each slot reserves its own KV cache up front. With gpt-oss-120b
+at 32K context q8_0, each Ollama slot is ~2.5 GB → 4 slots = +10 GB
+KV cache reservation, dropping VRAM headroom from 16 GB to 6 GB.
+Practically: every model becomes more expensive to keep warm.
+
+vLLM's PagedAttention doesn't reserve KV cache per slot. Instead it
+holds a single ~12 GB KV cache **pool** and dynamically allocates
+pages to active requests. The same 12 GB serves 1 user at 8K context
+OR 8 users at 1K context OR 4 users at 2K context — whatever fits.
+The numbers showed this clearly: vLLM held single-user latency at
+1.1 s through N=8 (per-request walls were within ±0.5 % of each
+other) while serving 1138 tok/sec aggregate.
+
+### The actual numbers (vs Appendix B's Ollama benchmark)
+
+| Metric | Ollama (B) | vLLM (C) | Cloud | vLLM vs Ollama | vLLM vs Cloud |
+|---|---|---|---|---|---|
+| TTFT warm | 198 ms | **26 ms** | 700 ms | 7.6× | 27× |
+| Single-user wall (200 tok) | 1571 ms | **1096 ms** | 2568 ms | 1.4× | 2.3× |
+| Single-user tok/s | 151 | **180** | 76 | 1.2× | 2.4× |
+| N=4 aggregate | 138 (serial) | **522** | 209 | 3.8× | 2.5× |
+| N=8 aggregate | ~138 (serial) | **1138** | 249 | 8.2× | 4.6× |
+| N=8 latency consistency | n/a (serial) | **±0.5 %** | ±50 % | — | — |
+
+vLLM is faster than Ollama at every single dimension. The N=8 numbers
+are the most striking — vLLM with continuous batching is essentially
+a different category of performance.
+
+### Mistakes I made during the migration
+
+1. **`:deploy` tag doesn't exist publicly.** The official vLLM recipe
+   docs pointed at `vllm/vllm-openai:deploy`, but that tag isn't on
+   Docker Hub. The actual tag is `vllm/vllm-openai:gptoss`. The
+   user-facing error was Docker's confusing "unauthorized: incorrect
+   username or password" — turns out Docker says this for "tag not
+   found AND we have stale credentials" rather than the more obvious
+   "tag not found." The fix was `docker logout` then pull again.
+
+   **Lesson**: when a Docker pull fails with "unauthorized" but the
+   image is meant to be public, check the tag exists before debugging
+   credentials. The error message is misleading.
+
+2. **First start failed VRAM check.** vLLM tried to grab 65 GiB but
+   only 61 GiB was free because Ollama still held 3 warm models. I
+   gave the user `curl /api/generate -d '{...keep_alive:0}'` to unload
+   translategemma — **that command didn't work** (the JSON shape
+   needs `prompt:""` and other fields, or just doesn't trigger unload
+   for some Ollama versions). The reliable unload is
+   `docker exec ollama ollama stop <model>` (the CLI knows the right
+   protocol) or `docker restart ollama` (the nuclear option, also
+   fastest).
+
+   **Lesson**: when a behavior depends on an API contract, prefer the
+   vendor's CLI over hand-rolled curl. The CLI is the authoritative
+   client.
+
+3. **Disk usage surprise.** HF cache reached 113 GB for what should
+   have been a ~60 GB model. The repo includes both MXFP4 weights
+   AND BF16 reference weights for non-MoE layers. We didn't fill the
+   disk, but it was a closer call than expected. With Premium SSD at
+   495 GB, this isn't a sustainability problem — but it's a thing
+   to monitor.
+
+   **Lesson**: assume HF will pull more than just the inference
+   weights. Budget 1.5-2× the "model size" for the cache.
+
+4. **MXFP4 is OpenAI's native format.** I initially planned to
+   download AWQ INT4 (the "standard" vLLM quantization for big
+   models), assuming gpt-oss would need post-training quantization.
+   In fact, gpt-oss-120b ships **natively MXFP4** from OpenAI —
+   trained quantization-aware. There's no AWQ version. Just point
+   vLLM at `openai/gpt-oss-120b` and it handles MXFP4 via Marlin
+   kernels on Hopper.
+
+   **Lesson**: for a model released by the original lab, check the
+   HF page for what quantization formats they shipped before
+   planning your own.
+
+### The pattern, generalised
+
+For any LLM workload where peak concurrency exceeds 1:
+
+1. Ollama is great as a "model zoo" — many models, easy swap, simple
+   ops, but **one request at a time per model**.
+2. vLLM is great as a "serving engine" — one model per process, **many
+   requests at a time**, but more operational complexity.
+3. **The hybrid is the right answer** — vLLM for the high-concurrency
+   workhorses (1-2 models), Ollama for the long tail of small/niche
+   models. They share the GPU via `--gpu-memory-utilization` on the
+   vLLM side and `MAX_LOADED_MODELS` on the Ollama side.
+
+### The vLLM benchmark script
+
+Preserved in `/tmp/vllm_vs_cloud.py`. Like the Ollama benchmark, it
+gets wiped by the daily deallocate. Regenerate it from the heredoc
+that produced it in the original chat. The two key differences from
+the Ollama benchmark:
+
+- vLLM uses `/v1/chat/completions` (OpenAI format) not `/api/chat`
+  (Ollama format). The script has separate `call_vllm()` and
+  `call_cloud()` paths.
+- vLLM streams via SSE; TTFT is the time-to-first-event, not
+  time-to-first-token-in-the-final-response.
+
+### Outstanding work to make vLLM the production path
+
+Updated 2026-05-19 — items 1 and 3 below shipped this session.
+
+1. ✅ **Container in `start_containers.sh`** (done 2026-05-19): vLLM is
+   now in Phase 2 (safety-net recreate via `/home/gravity/vllm/docker-run.sh`)
+   and Phase 4 (a wait-then-warm curl on `/v1/chat/completions`). The
+   container has `--restart unless-stopped`, so Docker brings it back
+   automatically across the daily deallocate cycle; the script's wait
+   loop polls `/v1/models` for up to 5 minutes before issuing the
+   warmup, accommodating vLLM's 2-5 minute cold start.
+2. ⏳ **Wrapper code change**: `/app/OllamaWrapper/Wrapper/views.py` (in
+   the Django container) still routes gpt-oss to Ollama Cloud. To make
+   vLLM the primary user-facing path, this needs to route to
+   `http://localhost:8001` instead. Easiest reversible approach:
+   mount-override `views.py` at runtime via `docker run -v
+   /host/path/views.py:/app/OllamaWrapper/Wrapper/views.py:ro` — no
+   image rebuild needed, easy to roll back.
+3. ✅ **Drop gpt-oss from Ollama** (done 2026-05-19): `ollama rm
+   gpt-oss:120b` + `rsync --delete` mirror to Premium SSD rollback.
+   Freed 65 GB on NVMe and 65 GB on rollback (122 GB total). Morning
+   auto-restore rsync window shrinks accordingly. Modelfile preserved
+   at `/home/gravity/saved-modelfiles/gpt-oss-120b.modelfile`.
+4. ⏳ **Decide on cloud fallback**: keep cloud routing as a
+   queue-overflow fallback (vLLM > 30 concurrent in flight), or drop
+   entirely. Recommend keeping for at least a month of stable local
+   operation, then revisit. The wrapper change in item 2 should
+   include the fallback logic when it's done.
+
+After items 2 and 4, gpt-oss is fully migrated to local vLLM, the
+cloud-routing surprise from Appendix B becomes purely historical, and
+the architecture matches the §14 routing rules cleanly.
+
+### Stress-test findings (2026-05-19, late session)
+
+After the productionization work, we ran a concurrency stress test
+ramping from N=1 to N=1024 to find the real capacity ceiling.
+
+**Headline: vLLM never refused a request.** Zero server-side errors
+through N=768; the 3 errors at N=1024 were client-side
+`[Errno 24] Too many open files` — the Python script hit the Linux
+default `ulimit -n` of 1024 sockets, **not vLLM rejecting connections**.
+The engine log showed 859 requests running simultaneously with KV
+cache at 83.8 %, still healthy.
+
+Three lessons from this:
+
+1. **Continuous batching scales further than expected on MoE models.**
+   vLLM held aggregate throughput at ~7900 tok/sec from N=512 onward.
+   gpt-oss-120b's MoE architecture (~5B active parameters per token
+   despite 120B total) means per-token compute is much lower than
+   a dense 120B would suggest. Translation: H100 NVL with MXFP4
+   gpt-oss is far more capable than the model name implies.
+
+2. **The client side hits limits before the server.** Default Linux
+   `ulimit -n` of 1024 file descriptors per process makes any Python
+   `concurrent.futures`-based test cap out around N=1000. If you need
+   to stress-test past that from a single client, run `ulimit -n
+   65536` first. Or distribute the load across multiple client machines.
+
+3. **The KV cache as canary.** vLLM's `Avg generation throughput:
+   X tokens/s, Running: Y reqs, GPU KV cache usage: Z%` log line is
+   the right thing to watch under load. KV cache utilization climbs
+   linearly with concurrent in-flight requests and tells you exactly
+   how much headroom remains. At 83.8 % we were comfortably below
+   the cliff; an extrapolated 100 % comes around N=1200.
+
+**Practical capacity for Gravity** (current traffic: ~4 req/hour):
+
+| Use case | Concurrent users supported |
+|---|---|
+| Real-time chat (latency = single-user baseline) | 8 |
+| Snappy interactive (p99 ≤ 2.3 s) | 64 |
+| Agents / RAG (p99 ≤ 5 s) | 192 |
+| Batch (p99 ≤ 12 s) | 512 |
+| Reliability ceiling (any latency) | >1024 (extrapolated ~1200) |
+
+This is 3-4 orders of magnitude over current peak load. The H100 NVL
+will not be the bottleneck for any near-term Gravity workload.
+
+Full numbers and methodology in `architecture-and-placement.md`
+Appendix C.8-C.10.
+
+### The 32K context experiment that didn't work (2026-05-19)
+
+After validating concurrency, we tried raising `--max-model-len` from
+8192 to 32768 — wanting to match the Ollama `OLLAMA_CONTEXT_LENGTH=32768`
+the previous session set as a global cap. Looked free on paper:
+PagedAttention allocates KV pages dynamically, so short requests
+shouldn't pay any extra cost.
+
+It didn't work. vLLM crashed during init, deterministically:
+
+```
+ERROR core.py:718  EngineCore failed to start.
+  File "vllm/v1/worker/gpu_model_runner.py", line 2318, in _dummy_sampler_run
+    sampler_output = self.sampler(logits=logits, ...)
+  File "vllm/v1/sample/sampler.py", line 135, in sample
+    random_sampled = self.topk_topp_sampler(...)
+```
+
+The crash happens AFTER weight loading, AFTER CUDA graph capture, during
+the dummy sampler warmup that vLLM uses to size its sampling kernels.
+`--restart unless-stopped` made it crash-loop — 15 cycles before we
+caught it.
+
+Diagnostic confusion this caused: while crash-looping, the container
+sometimes briefly appeared healthy (KV cache size and concurrency
+estimate are logged BEFORE the sampler dummy run). A 22K-token smoke
+test sent during one of these brief windows got `Connection reset by
+peer` — making it look like the long request caused the crash. It
+didn't; the crash had been happening since the first init.
+
+**Lesson 9 (new): when troubleshooting a crash loop, check
+`RestartCount` immediately.** `docker inspect <container> --format
+'{{.RestartCount}}'` is one command and tells you instantly whether
+you're looking at a stable system that fell over once or a system
+that's been crashing continuously. We spent 15 minutes chasing the
+"long request caused the crash" hypothesis when restart count was
+already at 15 — proof of repeated init failures, not request failures.
+
+**Lesson 10 (new): `--restart unless-stopped` masks crashes.** It's
+the right policy for production resilience, but it makes
+"is the container running?" a useless question — you have to look at
+RestartCount AND the latest log lines to know if it's stable or
+flapping. For testing/debugging new configs, prefer `--restart no` so
+crashes are immediately visible. Switch to `unless-stopped` only after
+the config is validated stable.
+
+**Fix that worked**: reverted to `--max-model-len 8192`. Single
+`docker stop` + edit + restart. RestartCount back to 0 immediately,
+service healthy.
+
+**Resolved (same day)**: switched the image from `vllm/vllm-openai:gptoss`
+to `vllm/vllm-openai:latest` (v0.21.0, mainline). 32K booted cleanly on
+the first attempt — the sampler init bug is fixed in newer builds.
+
+Side effects of the upgrade, beyond fixing the crash:
+
+| Metric | `:gptoss` (old) | `:latest` v0.21.0 (now) |
+|---|---|---|
+| Max context that boots | 8K | **32K** |
+| GPU KV cache pool | 174,096 tokens | **251,561 tokens** (+44 %) |
+| Init time | ~140 s | **89 s** (-36 %) |
+| MoE backend | older custom | **TRITON Mxfp4 + FlashAttention 3** |
+
+The bigger KV cache pool is the most interesting side effect: even
+ignoring the 32K capability, the new build serves more concurrent
+sequences at any context length because vLLM v0.21.0 manages KV memory
+more efficiently. We gave up nothing by upgrading.
+
+**Lesson 11 (new): try the latest stable tag before debugging an
+"experimental" tag.** The `:gptoss` tag was OpenAI's recommended path in
+docs from the model release date. It worked, but it was an early
+specialized build with known limitations. By the time we tried `:latest`
+(several months after the model's release), the gpt-oss support had
+been mainlined and improved. Default to mainline. Use special tags only
+when the latest stable explicitly doesn't support what you need —
+which, for most popular models, is rarely the case more than a few
+weeks after release.
+
+**Lesson 12 (new): a tag upgrade can be both the easiest fix AND give
+free improvements.** The KV cache pool 44 % increase wasn't a goal of
+the upgrade; it came along as a side effect of moving to the more
+optimized build. Periodically reviewing whether your pinned image tag
+is still the best choice is a small operational habit with outsized
+returns.
+
+### Surprise late in the session: cloud wins long-prompt concurrency on average
+
+After all the local-vs-cloud benchmark work concluded with "local wins
+every dimension," a follow-up client-side test from the Windows machine
+revealed a wrinkle: for **long-prompt requests at N≥4**, Ollama Cloud
+actually beats local vLLM on wall clock (4-8 s vs local 9-17 s). Why?
+
+Local vLLM has **one H100**. At N=4 concurrent long requests, all four
+share the GPU's compute and the 251K-token KV cache. Per-request walls
+get serialized to some degree.
+
+Ollama Cloud has **a fleet of GPUs**. At N=4 they fan out to 4
+different machines, each handling one request in parallel. Each gets
+~5 s; total wall is ~5 s.
+
+So for raw aggregate throughput on long prompts under concurrency,
+**horizontal scale beats single-host capacity** — even when the
+single host is an H100 NVL.
+
+**But** cloud has periodic 10× tail-latency outliers (one of 3
+single-request runs took 38.7 s vs the other two at 3.8/5.9 s). Local
+is rock-steady. For SLA-sensitive workloads, local still wins because
+predictability matters more than mean latency.
+
+**Lesson 13 (new): single-host vs horizontal-scale isn't a "which is
+better" question, it's "which dimension are you optimizing."**
+
+- Optimizing for **predictability / SLAs / consistency**: single-host
+  wins. The H100 doesn't share with other tenants; every request gets
+  identical resources every time.
+- Optimizing for **mean concurrent throughput on big requests**:
+  horizontal-scale cloud wins. They have N GPUs available; you have 1.
+- Optimizing for **single-user latency / TTFT**: single-host wins
+  again. No network round-trip, no shared-queue overhead.
+
+For Gravity's situation (4 req/hr peak, no SLAs yet, but a roadmap
+toward customer-facing products), local vLLM wins for everything that
+matters today. Re-run this comparison if/when sustained concurrent
+long-prompt traffic appears.
+
+**Lesson 14 (new): always client-side test the path users actually
+take, not just localhost benchmarks.** The earlier "local wins
+everything" conclusion was based on localhost-only measurements on the
+GPU box. Adding the Windows client confirmed predictability is local's
+real win and revealed the horizontal-scale advantage cloud has for
+concurrent long prompts. Both are real, both matter, neither was
+visible from localhost alone.
+
+### Production-validation: third daily cycle, 2026-05-20
+
+Three full daily deallocate-start cycles since 2026-05-18 build-out.
+All clean. The 2026-05-20 cycle was the first to test vLLM surviving
+the cycle with restart policy + Phase 4 wait loop:
+
+| Phase | Time |
+|---|---|
+| Boot start | 05:57:02 |
+| NVMe formatted + mounted (`mkdir -p` held) | 05:57:03 |
+| Restore: rsync 24 G from Premium SSD | 05:57:33 → 06:00:35 (3:02) |
+| Ollama starts | 06:00:35 → 06:01:11 |
+| Phase 4 waits for vLLM (cold-load) | 06:01:11 → 06:06:11 (5:00) |
+| vLLM + mistral warmups complete | 06:06:11 → 06:06:24 (0:13) |
+| `boot finished` | 06:06:24 |
+| **Total unattended boot** | **9:22** |
+
+Verification immediately after boot:
+- `vllm_gpt_oss` RestartCount = 0 (no init crashes — `:latest` build is stable at 32K)
+- All 6 Ollama models present (no gpt-oss / phi4 — stayed deleted across the cycle)
+- Mistral loaded in VRAM via Phase 4 warmup
+- vLLM serving `openai/gpt-oss-120b` with a real reply on first probe
+
+**Lesson 15 (new): three cycles is enough to declare a daily-pattern
+infrastructure "production-validated."** One cycle proves the script
+runs; two proves it's not a fluke; three proves the design handles
+the steady state. For weekly/monthly patterns the count would be
+different, but for daily cycles, three is the right threshold to stop
+hovering over the morning boot.
+
+The original NVMe disaster on 2026-05-18 took ~75 minutes to recover
+and rebuild the auto-restore architecture. Three days later, the same
+disaster recovers in ~9 minutes, unattended, every morning. The
+investment paid for itself on day two.
+
+### Outstanding work after the 2026-05-20 validation
+
+| Item | Status | Notes |
+|---|---|---|
+| Wrapper code change (route gpt-oss → vLLM) | ⏳ pending | Will deliver ~800 ms latency improvement + remove cloud truncation/seed bugs from user-visible behavior |
+| Cloud fallback decision | ⏳ pending | Recommend keeping for ~1 month of stable local operation before deciding |
+| Long-context vLLM at full 128K (the model's native cap) | not planned | 32K is sufficient for current and near-term workloads |
+
+Everything else is shipped and validated. The session is complete.
