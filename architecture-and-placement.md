@@ -673,43 +673,70 @@ expensive than local — depends on your traffic. Worth pulling the actual
 ollama.com billing data and comparing against a "what if it ran locally"
 estimate.
 
-### Measured 2026-05-18 — when cloud is actually faster
+### Measured 2026-05-18 (Ollama) — when cloud was actually faster
 
-Full benchmark and numbers in **Appendix B**. The decision-relevant
-findings:
+**Superseded by the vLLM benchmark on 2026-05-19. Kept here as history.**
 
-- **Local wins single-user latency by a lot.** TTFB 198 ms vs 694 ms
-  (3.5×). Warm eval rate 151 vs 70 tok/sec (2.2×). Local response
-  variance ±0.5 %, cloud ±25 %.
-- **The crossover is at ~2 concurrent requests.** At N=1 local wins
-  by 1.4 s. At N=2 they're tied. At N=4 cloud wins by 2.7 s because
-  local serializes (`OLLAMA_NUM_PARALLEL=1`) while cloud parallelizes.
-- **Cloud silently truncates outputs.** Requested 200 tokens, sometimes
-  got 165–192. `num_predict` is a hint to cloud, not a contract.
-  Anything downstream that expects fixed-length output (templated
-  responses, structured extraction, JSON-mode-style pipelines) can
-  break under cloud routing in ways that never reproduce locally.
-- **Cloud doesn't honor `seed` reliably.** Same `seed=42, temp=0`
-  produced different opening tokens across runs. Not safe for
-  reproducibility-sensitive evals or A/B comparisons.
+The original Ollama-vs-cloud benchmark identified a crossover at ~2
+concurrent users — local won at N=1, cloud won at N≥3. Findings:
 
-Updated routing rule (replaces the prior "pick A/B/C" framing):
+- Single-user TTFB 198 ms (local) vs 694 ms (cloud) — 3.5× faster local.
+- Warm eval rate 151 vs 70 tok/sec — 2.2× faster local.
+- At N=4, cloud won by 2.7 s wall clock because Ollama's `NUM_PARALLEL=1` serialized requests.
+- Cloud silently truncates outputs (returned 165 tokens when asked for 200) and ignores `seed`.
+
+The conclusion at the time: "split traffic by concurrency — local for
+N<3, cloud for N≥3." That framing was correct for Ollama but became
+moot once gpt-oss moved to vLLM (next section).
+
+### Measured 2026-05-19 (vLLM) — local wins at every concurrency level
+
+Full benchmark in **Appendix C**. After migrating gpt-oss to vLLM on
+the same H100 NVL, every metric shifted decisively in local's favor:
+
+| Metric | vLLM local | Cloud | vLLM advantage |
+|---|---|---|---|
+| Wall clock (200 tok warm) | **1096 ms** | 2568 ms | **2.3× faster** |
+| TTFT (warm) | **26 ms** | 700 ms | **27× faster** |
+| Single-user tok/sec | **180** | 76 | **2.4× faster** |
+| N=4 aggregate tok/sec | 522 | 209 | **2.5× higher** |
+| N=8 aggregate tok/sec | **1138** | 249 | **4.6× higher** |
+| N=8 per-request variance | **±0.5 %** | ±50 % | rock-steady |
+
+At N=8 every vLLM request completed in 1.12 s ± 0.005 s — continuous
+batching means concurrent requests share kernels rather than queue.
+
+**For short prompts, the crossover is gone.** Local vLLM beats cloud
+at every load level tested (N=1 through N=8). For long prompts, a
+follow-up client-side test (Appendix C.13) revealed a more nuanced
+picture — cloud's horizontal scale wins above N=4. Updated routing
+rule:
 
 | Workload | Route | Why |
 |---|---|---|
-| Interactive single-user chat | **LOCAL** | 3.5× faster first-token; rock-steady |
-| Templated / fixed-length outputs | **LOCAL** | Cloud ignores `num_predict` |
-| Evals / reproducibility | **LOCAL** | Cloud ignores `seed` |
-| Batch or ≥ 3 simultaneous requests | **CLOUD** | Local serializes; cloud has horizontal headroom |
-| Burst overflow (local queue depth > 1) | **CLOUD** | Avoid queue tax |
-| Disaster recovery (VM down or mid-restore) | **CLOUD** | Only option |
+| Single user (any prompt size) | **LOCAL vLLM** | Always 1.3 s faster than cloud, ±0.5 % variance vs cloud's ±100 % |
+| Short prompts, any concurrency up to 800+ | **LOCAL vLLM** | Stress-tested; cloud caps at ~250 tok/s aggregate, local hits 7,900 tok/s |
+| Long prompts (>10K input), N ≤ 2 | **LOCAL vLLM** | Best latency and consistency |
+| Long prompts (>10K input), N ≥ 4 | **Cloud** wins on average | Horizontal scale (cloud spreads N=4 across separate GPUs at ~5 s each; local has one H100 at ~9 s wall). **But** cloud has occasional 10× outliers — 38 s observed once. Choose local if SLA matters. |
+| Reproducibility / templated output (any size) | **LOCAL vLLM** | Cloud ignores `seed` and `num_predict` |
+| SLA-sensitive (any size) | **LOCAL vLLM** | Cloud's variance can spike to 38 s; local is 3.7 s ± 0.02 s |
+| Disaster recovery (vLLM down) | cloud fallback | only option |
 
-**Local could close the concurrency gap** by raising
-`OLLAMA_NUM_PARALLEL` from 1 to 2 (or 4). Each parallel slot costs
-~2–3 GB of VRAM at q8_0 + 32K context for gpt-oss-120b; current
-headroom is ~16 GB. Two parallel slots fit comfortably; four is
-tight. The trade-off: VRAM reserved for parallelism can't be used to
-host more models. Worth testing if real traffic ever sustains N ≥ 2.
+Two principles that emerge:
+
+1. **For predictability, local always wins.** The H100 NVL serves
+   every request in essentially the same time. Ollama Cloud is a
+   shared-tenant service whose latency depends on what other
+   customers are doing — best-case competitive, worst-case 10× worse.
+2. **For raw throughput on concurrent long prompts, cloud's
+   horizontal scale beats one H100.** This will reverse if Gravity
+   ever adds a second GPU host.
+
+**MVP wrapper routing** (good enough for now): "all gpt-oss → local
+vLLM, cloud as fallback on local error or queue depth > K." This
+captures 90 % of the available win plus all the consistency benefits,
+and only loses on the niche case of sustained concurrent long-prompt
+traffic — a workload Gravity doesn't have today (current peak 4 req/hr).
 
 ---
 
@@ -1049,3 +1076,278 @@ python3 /tmp/benchmark.py 2>&1 | tee /tmp/benchmark_output_$(date +%F).txt
 
 (Script body preserved in `/tmp/benchmark.py`. If wiped by the daily
 deallocate, regenerate from the heredoc in `learnings/2026-05-18-gpu-llm-optimization.md`.)
+
+---
+
+## Appendix C — vLLM vs Cloud benchmark: gpt-oss-120b (2026-05-19)
+
+After Appendix B's Ollama benchmark identified Ollama's `NUM_PARALLEL=1`
+as the concurrency bottleneck, we migrated gpt-oss-120b to vLLM on the
+same H100 NVL and re-ran the comparison. **Local won every dimension.**
+
+Setup at time of measurement:
+- LOCAL = `http://localhost:8001/v1/chat/completions` (vLLM container
+  `vllm/vllm-openai:gptoss` serving `openai/gpt-oss-120b` natively in
+  MXFP4 — OpenAI's own quantization format)
+- CLOUD = `http://localhost:11434/api/chat` (via `ollama_wrapper`,
+  routes gpt-oss to Ollama Cloud as before)
+- vLLM config: `--gpu-memory-utilization 0.85 --max-model-len 8192
+  --max-num-batched-tokens 1024 --no-enable-prefix-caching`
+- vLLM container reports: 64.4 GiB weights in VRAM, 12.0 GiB KV cache
+  budget = 174K tokens total, max 37× concurrent at 8K each.
+
+### C.1 — Output length sweep (medium prompt, 3 warm runs each)
+
+| Path | 50 tok wall | 200 tok wall | 800 tok wall* | Single-user tok/s |
+|---|---|---|---|---|
+| **LOCAL vLLM** | **291 ms** | **1096 ms** | **1094 ms** | **~180** (±0.5 %) |
+| CLOUD | 1218 ms | 2568 ms | 1997 ms | ~76 |
+| **vLLM advantage** | **4.2×** | **2.3×** | **1.8×** | **2.4×** |
+
+*Both hit natural EOS before 800 tokens — vLLM at ~198, cloud at ~162-215.
+
+vLLM is faster than the prior Ollama benchmark too (151 → 180 tok/s),
+despite the "MXFP4 not fully optimized yet" warning. Hopper's Marlin
+MXFP4 kernels are already competitive.
+
+### C.2 — Time-to-first-token (streaming, 3 runs each)
+
+| Path | TTFB (median) | Variance |
+|---|---|---|
+| **LOCAL vLLM** | **26 ms** | ±10 ms |
+| CLOUD | 700 ms | ±150 ms |
+| **vLLM advantage** | **27×** | tighter |
+
+26 ms is effectively instant — faster than the Django wrapper's own
+HTTP overhead (~58 ms warm). For interactive chat UX this is the
+single most important number.
+
+### C.3 — Concurrency scaling (200 tok each — the killer test)
+
+| N | LOCAL vLLM wall | per-req variance | aggregate tok/s | CLOUD wall | aggregate tok/s | vLLM aggregate advantage |
+|---|---|---|---|---|---|---|
+| 1 | **1099 ms** | — | 180 | 4707 ms | 42 | **4.3×** |
+| 2 | 1297 ms | ±10 % | **276** | 3288 ms | 121 | **2.3×** |
+| 4 | 1309 ms | ±15 % | **522** | 3768 ms | 209 | **2.5×** |
+| 8 | **1125 ms** | **±0.5 %** | **1138** | 6258 ms | 249 | **4.6×** |
+
+The N=8 row is the most surprising. vLLM's per-request walls were
+`[1114, 1124, 1123, 1123, 1122, 1123, 1122, 1122] ms` — essentially
+identical. **Eight concurrent users got the same latency as one.**
+That's continuous batching working as advertised: the GPU sees 8
+parallel sequences as a single batched matmul and processes them
+together.
+
+Cloud at N=8 had walls ranging 2.4 s to 6.3 s, with overall throughput
+plateauing at 249 tok/s. Beyond N=4 cloud capacity is constrained.
+
+### C.4 — Why the earlier "crossover" disappeared
+
+The Ollama benchmark (Appendix B) identified a crossover at N≈2 where
+cloud caught up because Ollama's `NUM_PARALLEL=1` serialized requests.
+vLLM doesn't have that limit — every concurrent request shares kernels
+via PagedAttention. The 4.6× aggregate advantage at N=8 is the
+quantification of "vLLM was designed for concurrent serving; Ollama
+wasn't."
+
+The 5/20 % decision rule from §13 is also moot for gpt-oss now — local
+wall clock is so much faster than cloud that the percentage of "request
+time spent on network" is negligible regardless of concurrency.
+
+### C.5 — Caveats
+
+- Numbers are point-in-time. Cloud capacity drifts; re-run quarterly.
+- vLLM `--max-model-len 8192` — long-context workloads will need a
+  higher value, at the cost of fewer concurrent slots (KV cache budget
+  is shared across all in-flight requests).
+- vLLM hot at the moment of measurement; cold starts add 90-180 s
+  (Appendix C's runs were post-warmup).
+- We did not test gpt-oss reasoning quality A/B vs the Ollama GGUF Q4
+  version — only throughput. Quality A/B is recommended before
+  retiring the Ollama version permanently.
+- MXFP4 marlin kernels are still being optimized in vLLM. Future
+  versions may push single-user tok/s past 200.
+
+### C.6 — How to re-run
+
+Script preserved at `/tmp/vllm_vs_cloud.py` (wiped on daily deallocate;
+regenerate from the heredoc in
+`learnings/2026-05-18-gpu-llm-optimization.md`).
+
+```bash
+python3 /tmp/vllm_vs_cloud.py 2>&1 | tee /tmp/vllm_vs_cloud_$(date +%F).txt
+```
+
+### C.7 — Implications for placement
+
+The data closes three open questions from §14:
+
+1. **"Should we move gpt-oss off cloud?"** — yes, decisively. Cloud was
+   2-27× slower on every measured dimension. The cost case (cloud
+   billing per token, local sunk cost) only widens the gap.
+2. **"Will vLLM cold-start hurt?"** — yes, but only once per VM uptime.
+   ~90-180 s for model load + CUDA graph capture. Daily deallocate cycle
+   means this is paid once per morning, which is acceptable. Build it
+   into the morning warm-up.
+3. **"Should Ollama keep a copy of gpt-oss?"** — no. With vLLM
+   committed as the gpt-oss serving path, the 65 GB Ollama GGUF on NVMe
+   (plus 65 GB on the Premium SSD rollback) is dead weight.
+
+### C.8 — Stress-test ceiling (2026-05-19, extended run)
+
+The original benchmark stopped at N=8. A follow-up stress test ramped
+all the way to N=1024 concurrent. Key results:
+
+| N | p50 (ms) | p99 (ms) | Throughput | KV cache peak | Errors |
+|---|---|---|---|---|---|
+| 16 | 1427 | 1430 | 1913 tok/s | — | 0 |
+| 64 | 2238 | 2261 | 4434 tok/s | — | 0 |
+| 128 | 3419 | 3536 | 5783 tok/s | — | 0 |
+| 256 | 5902 | 6129 | 6680 tok/s | — | 0 |
+| 512 | 10993 | 11456 | 7346 tok/s | ~55 % | 0 |
+| 768 | 14777 | 16494 | **7891 tok/s** | **76 %** | 0 |
+| 1024 | 17687 | 22614 | 7686 tok/s | **84 %** | 3 (client-side) |
+
+**Critical finding: the 3 errors at N=1024 were CLIENT-SIDE**
+(`urlopen error [Errno 24] Too many open files` — Linux default
+`ulimit -n` = 1024 was hit by the Python client, not by vLLM).
+The engine log confirmed vLLM ran **859 requests simultaneously**
+with KV cache at 83.8 %, never refused a connection. **We did not
+find vLLM's actual ceiling**; it's somewhere past N=1024.
+
+### C.9 — Concurrent-user ceilings (practical, by use case)
+
+| Workload | Safe concurrent | Why |
+|---|---|---|
+| Interactive chat (UX latency = baseline) | **≤ 8** | p50 stays at ~1.1 s, no perceived lag |
+| Snappy interactive (p99 ≤ 2.3 s) | **≤ 64** | latency grows gracefully, throughput climbs to 4400 tok/s |
+| Agents / RAG / internal tools (p99 ≤ 5 s) | **≤ 192** | aggregate ~6300 tok/s; KV cache still mostly empty |
+| Batch processing (p99 ≤ 12 s) | **≤ 512** | aggregate 7300 tok/s — near GPU compute ceiling |
+| Server-side reliability ceiling | **≥ 1024** (extrapolated ~1200) | KV cache exhausts around there; ulimit on client is hit first |
+
+**Throughput ceiling: ~7,900 tok/sec aggregate** on this H100 NVL with
+MXFP4 gpt-oss-120b. The GPU's actual compute limit for this workload.
+
+For Gravity's current ~4 req/hr traffic, the system is 3+ orders of
+magnitude over-provisioned. That's not a criticism — it's the right
+size for room to grow (concurrent agents, RAG pipelines, future
+products) without a hardware upgrade.
+
+### C.10 — If you ever need to push past N=1024 from one client
+
+```bash
+ulimit -n 65536   # raise file descriptor limit
+python3 /tmp/vllm_stress.py
+```
+
+Or distribute the load across multiple client machines. The vLLM
+container will keep accepting connections until KV cache exhausts
+(~N=1200 estimated). Past that, you'd see legitimate vLLM errors:
+either `Waiting:` queue growth (visible in `docker logs vllm_gpt_oss`)
+or request rejections.
+
+### C.11 — 32K context stress test (post-image-upgrade, 2026-05-19)
+
+After upgrading from `vllm/vllm-openai:gptoss` to
+`vllm/vllm-openai:latest` (v0.21.0) and raising `--max-model-len` to
+32768, we re-tested concurrency at **near-full context** (25K input
+tokens + up to 500 output) to find the practical ceiling for the
+worst-case workload.
+
+| N | Wall (s) | KV cache used | Combined throughput | Notes |
+|---|---|---|---|---|
+| 1 | 3.7 | 10 % | 6,850 tok/s | baseline |
+| 4 | 9.1 | 40 % | 11,123 tok/s | strong batching |
+| 8 | 16.6 | 80 % | 12,174 tok/s | smooth |
+| **10** | **20.7** | **99 %** | **12,229 tok/s** | **at the cliff — no queueing yet** |
+| 12 | 25.4 | **120 %** | 11,968 tok/s | queueing visible (min/max spread 18 s → 25 s) |
+
+**Key insights:**
+- **N=10 concurrent 25K-context requests is the comfortable ceiling**
+  for this hardware + config. Past that requests queue but don't fail.
+- **Combined throughput at 25K context (12,229 tok/s) is 55 % HIGHER
+  than at short prompts (7,900 tok/s)** because long-context workloads
+  are prefill-heavy and prefill is compute-bound parallel attention —
+  more GPU-efficient than the memory-bound decode phase.
+- **vLLM's startup estimate ("7.68× at 32K") was conservative.** At
+  25K (the practical usage size) we get 10× concurrent without
+  queueing.
+- **No errors at any tested N** — queueing is graceful, not catastrophic.
+
+### C.12 — Practical capacity reference (definitive, 2026-05-19)
+
+| Prompt size pattern | Comfortable concurrent | Hard ceiling (queueing starts) | Throughput |
+|---|---|---|---|
+| Long-context RAG (~25K input) | **~10** | ~10-11 | ~12,200 tok/s |
+| Medium RAG (~10K input) | ~25 | ~25 (extrapolated) | ~11,000 tok/s (extrapolated) |
+| Short chat (~250 tok) | 800+ | likely 1500+ | ~7,900 tok/s |
+
+The throughput numbers are NOT directly comparable across rows —
+they're combined input+output tok/s, so a workload with more input
+tokens "earns" higher numbers without doing more work per user. Use
+the per-user wall clock for SLA decisions.
+
+### C.13 — Client-side long-prompt test: cloud horizontal scale beats local at N≥4 (2026-05-19)
+
+After characterizing local vLLM capacity (C.8-C.12), we tested the same
+workload *from a Windows client over public DNS* through the wrapper at
+port 11434 (which still routes gpt-oss to Ollama Cloud). 20K-token
+prompts, 500-token output cap, concurrent N from 1 to 8.
+
+| N | Cloud wall (Windows → wrapper) | Local vLLM wall (GPU loopback, Appendix C.11) | Winner |
+|---|---|---|---|
+| 1 | 5.0 s | **3.7 s** | local by 1.3 s |
+| 2 | 6.3 s | **5.7 s** | local by 0.6 s |
+| 4 | **4.7 s** | 9.1 s | **cloud by 4.4 s** |
+| 6 | **7.3 s** | 13.1 s | **cloud by 5.8 s** |
+| 8 | **7.8 s** | 16.6 s | **cloud by 8.8 s** |
+
+**This contradicts the earlier "local wins everything" claim** in C.5
+and earlier §14 framings. The reason is straightforward: Ollama Cloud
+has horizontal scale (many GPUs), and at N=8 it spreads the load across
+8 separate GPUs (each request ~4-8 s). Local vLLM has one H100, so 8
+concurrent long-prompt requests share KV cache and compute (each
+request ~16 s wall).
+
+### C.13.1 — But cloud has tail-latency outliers
+
+Earlier single-request testing (3 runs) saw cloud latencies of 3.8 s,
+5.9 s, and **38.7 s**. One in three runs was 10× the median. The N=8
+batched test above didn't hit a tail event during its 5 minutes of
+runtime, but they happen — cloud capacity fluctuates with other
+tenants' traffic.
+
+| Path | Best | Median | Worst observed |
+|---|---|---|---|
+| Cloud single-request | 3.8 s | ~6 s | **38.7 s** |
+| Cloud N=8 parallel | 3.9 s | 6.7 s | 7.8 s (lucky run) |
+| Local vLLM N=1 | 3.7 s | 3.7 s | 3.7 s (±0.5 %) |
+| Local vLLM N=8 | 14.6 s | 15.9 s | 16.6 s (±5 %) |
+
+**Local is dramatically more predictable.** For SLA-sensitive workloads
+(chatbots, RAG with timeouts), local wins even at high N — because a
+38 s outlier breaks the user experience even if averages look fine.
+
+### C.13.2 — Routing decision matrix (definitive)
+
+| Workload pattern | Best path | Why |
+|---|---|---|
+| Single user, short prompt | local | 26× faster TTFT |
+| Single user, long prompt | local | 1.3 s faster, 200× more predictable |
+| Few users (≤ 2), any size | local | Better in both dimensions |
+| Many users (≥ 4), short prompts | local | Stress-tested to 800+ concurrent, no errors |
+| Many users (≥ 4), long prompts (mean case) | cloud | Cloud's horizontal scale wins on average |
+| Many users (≥ 4), long prompts, SLA matters | local | Local's consistency beats cloud's variance |
+| Reproducibility / fixed-length output | local | Cloud ignores `seed`/`num_predict` |
+| Local capacity overflow | cloud (fallback) | Only option |
+| Local service down | cloud (fallback) | Only option |
+
+### C.13.3 — When this answer changes
+
+- **Adding a second GPU host**: local horizontal scale matches cloud,
+  cloud's only remaining advantage disappears. Migrate fully.
+- **Adding short SLA targets** (e.g. 95th percentile under 5 s): cloud
+  becomes unacceptable due to tail latency. Migrate fully to local
+  regardless of N.
+- **Cloud pricing change or your traffic outgrows the free tier**: cost
+  case for full local migration becomes urgent regardless of latency.
