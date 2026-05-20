@@ -172,20 +172,23 @@ NVIDIA runtime registered. All four containers were `Up 6 hours` at sample.
 ### Ollama model storage
 
 - **Active**: bind mount `/mnt/nvme/ollama` → `/root/.ollama` inside the
-  container. **112 GB used** by **8 models** as of 2026-05-18 (down from 175 GB / 11 models — see deletions below).
-- **Inactive (kept for rollback)**: the original Docker named volume `ollama` at `/var/lib/docker/volumes/ollama/_data` still holds the pre-migration snapshot on the Premium SSD. Delete with `docker volume rm ollama` after the NVMe-backed setup is verified stable.
-- **HuggingFace cache** (79 GB, used by the embedding wrapper and host-side
-  scripts) still lives on the Premium SSD — not yet migrated to NVMe.
+  container. **24 GB used** by **6 models** as of 2026-05-19 (down from 175 GB / 11 models — see deletions below).
+- **Rollback / source of truth**: the Docker named volume `ollama` at `/var/lib/docker/volumes/ollama/_data` on Premium SSD is now the persistent source for the daily auto-restore. **DO NOT** delete — it feeds Phase 1 of `start_containers.sh` every morning.
+- **HuggingFace cache** lives on Premium SSD at `/home/gravity/hf-cache` (~113 GB after pulling `openai/gpt-oss-120b` for vLLM) and at `/home/gravity/embedding-wrapper/volume-mapping/cache` for the embedding wrapper.
 
-### Models removed 2026-05-18
+### Models removed
 
-| Model | Disk | Reason |
-|---|---|---|
-| `llama3.3:latest` | 42 GB | Unused — confirmed by operator |
-| `deepseek-ocr:latest` | 6.7 GB | Unused — confirmed by operator |
-| `glm-4.7-flash:latest` | 19 GB | Unused — operator confirmed only `glm-ocr` is needed for OCR |
+| Model | Date | Disk | Reason |
+|---|---|---|---|
+| `llama3.3:latest` | 2026-05-18 | 42 GB | Unused |
+| `deepseek-ocr:latest` | 2026-05-18 | 6.7 GB | Unused |
+| `glm-4.7-flash:latest` | 2026-05-18 | 19 GB | Unused; `glm-ocr` is sufficient |
+| `phi4_compliance:latest` | 2026-05-18 | 29 GB | Unused; Modelfile preserved at `/home/gravity/saved-modelfiles/` |
+| `gpt-oss:120b` | 2026-05-19 | 65 GB | **Migrated to vLLM** — see §7 cloud-routing/vLLM section |
 
-Total freed: **~67 GB**. 8 models remain: `mistral:instruct`, `gpt-oss:120b`, `phi4_compliance`, `translategemma:27b`, `glm-ocr`, `embeddinggemma`, `nomic-embed-text`, `gravity-nomic`.
+Total freed: **~162 GB** on NVMe + matching deletion on Premium SSD rollback = **~324 GB across both tiers**.
+
+**6 models remain on Ollama**: `mistral:instruct` (4.1 GB), `translategemma:27b` (17 GB), `glm-ocr` (2.2 GB), `embeddinggemma` (621 MB), `nomic-embed-text` (274 MB), `gravity-nomic` (274 MB). Total ~24 GB on disk. `gpt-oss:120b` lives separately on vLLM (see below).
 
 ### VRAM at sample time
 
@@ -279,20 +282,97 @@ directly. `gpt-oss:120b` local cold-load is **6.2 seconds** post-NVMe migration
 (was 380 s on Premium SSD); warm inference is **151 tokens/sec** on the H100
 (measured 2026-05-18, ±0.5 % run-to-run variance).
 
-**Benchmark vs Ollama Cloud (2026-05-18)** — full tables in
-`architecture-and-placement.md` Appendix B. Headlines:
+**Benchmark vs Ollama Cloud (2026-05-18 Ollama; 2026-05-19 vLLM)** —
+full tables in `architecture-and-placement.md` Appendix B (Ollama) and
+Appendix C (vLLM). Headlines from the **vLLM** path, now the
+recommended one for gpt-oss:
 
-- TTFB: local 198 ms, cloud 694 ms (3.5× faster locally).
-- Warm eval rate: local 151 tok/sec, cloud ~70 tok/sec end-to-end (2× faster locally).
-- Concurrency crossover at N≈2 — at N=4, cloud wins by 2.7 s because local serializes (`OLLAMA_NUM_PARALLEL=1`).
-- Cloud silently truncates outputs (`num_predict=200` sometimes returned 165) and doesn't honor `seed`.
+- TTFT: **26 ms** local vLLM vs 700 ms cloud (27× faster locally).
+- Warm tok/sec: **180** local vLLM vs 76 cloud (2.4× faster locally).
+- Concurrent N=8 aggregate: **1138 tok/sec** local vLLM vs 249 cloud (4.6× higher).
+- N=8 latency consistency: ±0.5 % local vs ±50 % cloud.
+- Cloud still silently truncates and ignores `seed`.
 
-Practical rule: send single-user / interactive / templated / eval
-traffic to **local** (`:11433`). Send batch or ≥ 3-way concurrent
-traffic to **cloud** (`:11434`).
+**Practical rule (post-vLLM migration, refined 2026-05-19):**
 
-See `architecture-and-placement.md` §14 for routing details and
-Appendix B for the full benchmark.
+| Workload | Route | Reason |
+|---|---|---|
+| Single user (any prompt size) | **local vLLM (port 8001)** | always faster, ±0.5 % vs ±100 % variance |
+| Short prompts at any concurrency | **local vLLM** | stress-tested to 1024+, no errors |
+| Long-prompt RAG at N ≥ 4 (mean case) | cloud wins ~4-8 s vs local 9-16 s wall | cloud's horizontal scale |
+| Long-prompt RAG with SLA constraints | **local vLLM** | cloud has 10× tail-latency outliers |
+| Reproducibility / fixed-length | **local vLLM** | cloud ignores `seed`, `num_predict` |
+| Burst / disaster recovery | cloud fallback | only option |
+
+**MVP wrapper change recommendation**: "all gpt-oss → local vLLM, cloud
+as fallback on local error or queue overflow." This captures the
+single-user, short-prompt, and SLA wins. The only workload it
+deoptimizes is sustained concurrent long-prompt RAG — a workload
+Gravity doesn't have at current 4 req/hr peak.
+
+See `architecture-and-placement.md` §14 for the full reasoning and
+Appendix C.11-C.13 for the benchmark data behind each row.
+
+**Serving stack for gpt-oss as of 2026-05-19:**
+- vLLM container `vllm/vllm-openai:gptoss` serving `openai/gpt-oss-120b`
+- Listens on host port 8001 (container 8000)
+- HF cache on Premium SSD at `/home/gravity/hf-cache` (~113 GB, persists across daily deallocate)
+- VRAM footprint: 64.4 GiB weights + 12.0 GiB KV cache budget at `--gpu-memory-utilization 0.85 --max-model-len 8192`
+- Cold-start: ~90-180 s (weights load + CUDA graph capture)
+
+**Concurrent capacity (stress-tested 2026-05-19):**
+
+| Workload pattern | Concurrent capacity | Aggregate throughput |
+|---|---|---|
+| **Short chat** (~250 tokens total) | 800+ confirmed, ~1500 extrapolated | ~7,900 tok/sec |
+| **Long-context RAG** (~25K tokens input) | **10 simultaneous before queueing** | **~12,200 tok/sec combined in+out** |
+
+- **Reliability: zero server-side errors observed** through N=1024 (short prompts) and N=12 (25K prompts). The 3 errors at N=1024 were client-side (`ulimit -n` exhausted). Past the comfortable ceiling, vLLM queues gracefully — it does not refuse connections.
+- **Throughput is HIGHER for long-context workloads** (12,229 tok/s at 25K-context N=10) than short-prompt workloads (7,900 tok/s at short N=512). Reason: long inputs are prefill-heavy, and prefill is compute-bound parallel attention — better GPU utilization than memory-bound decode.
+- **Short-request latency tiers:**
+  - Real-time chat (≤ 1.2 s): up to **8 concurrent**
+  - Snappy interactive (≤ 2.3 s): up to **64 concurrent**
+  - Agents / RAG (≤ 5 s): up to **192 concurrent**
+  - Batch (≤ 12 s): up to **512 concurrent**
+- **Long-context latency**: ~3.7 s for 1 user, ~20 s for 10 users (linear scaling past N=4).
+
+Current production traffic is ~4 req/hour — system is 3+ orders of
+magnitude over-provisioned for headroom. Full stress-test results in
+`architecture-and-placement.md` Appendix C.8 (short prompts), C.11
+(long context), and C.12 (definitive capacity reference table).
+
+**Context length set to 32K via `vllm/vllm-openai:latest` (2026-05-19):**
+
+Originally ran on the `:gptoss` tag at 8K because 32K crash-looped on
+that build (sampler init bug). Switching to `vllm/vllm-openai:latest`
+(v0.21.0) resolved it — 32K boots cleanly. The `:gptoss` tag was an
+early specialized build that has since been mainlined; the `:latest`
+tag is now the recommended path.
+
+New runtime config (post-upgrade):
+
+| Parameter | Value |
+|---|---|
+| Image | `vllm/vllm-openai:latest` (v0.21.0) |
+| `--max-model-len` | **32768** |
+| GPU KV cache pool | **251,561 tokens** (up from 174K on the old build) |
+| Max concurrency at 32K full context | **7.68×** |
+| Init time | ~89 s (down from ~140 s) |
+| MoE backend | TRITON Mxfp4 + FlashAttention 3 |
+
+The KV pool grew 44 % despite the higher per-request cap — v0.21.0
+manages KV cache more efficiently. Net result: at 32K cap, you have
+about the same effective concurrency for typical short prompts as you
+had at 8K cap on the old build, plus the ability to handle long-context
+requests.
+
+**Historical note on the crash discovered earlier in the session:**
+The `:gptoss` tag crashed deterministically in `_dummy_sampler_run`
+when started with `--max-model-len 32768`. We verified 15 consecutive
+crashes via `RestartCount` before catching it. The diagnostic confusion
+(thinking a long 22K-token request had caused the crash, when in fact
+the crash was during init and the long request just happened to hit a
+crash-cycle) is documented as Lessons 9 and 10 in the learnings doc.
 
 ---
 
@@ -325,18 +405,18 @@ Listening on the host (from `ss -tulpn`):
 
 ## 10. Storage Layout
 
-Post-NVMe-migration layout (2026-05-18):
+Post-cleanup layout (updated 2026-05-20):
 
 | Path | Size | Disk | Notes |
 |---|---|---|---|
-| **`/mnt/nvme/ollama`** | **112 G** | **NVMe** | **Active Ollama model store (bind-mounted into the `ollama` container as `/root/.ollama`). 8 models.** |
-| `/var/lib/docker/volumes/ollama` | 112 G | Premium SSD | Stale snapshot of pre-NVMe Ollama models — kept as rollback. Delete with `docker volume rm ollama` once NVMe-backed setup is verified stable. |
-| `/var/lib/docker/overlay2` | 29 G | Premium SSD | Container layers |
-| `/var/lib/docker/containers` | 104 M | Premium SSD | Container metadata / json-file logs |
-| `/root/.cache/huggingface` | 79 G | Premium SSD | HuggingFace cache for host-side Python work — candidate for future NVMe move |
+| **`/mnt/nvme/ollama`** | **24 G** | **NVMe** | **Active Ollama model store (bind-mounted into the `ollama` container as `/root/.ollama`). 6 models** (down from 11 → 8 → 6 after llama3.3 / deepseek-ocr / glm-4.7-flash / phi4_compliance / gpt-oss-120b removals). |
+| `/var/lib/docker/volumes/ollama` | 24 G | Premium SSD | **Source of truth for daily auto-restore** — kept in sync with NVMe via post-deletion `rsync --delete`. **DO NOT** `docker volume rm ollama`. |
+| `/home/gravity/hf-cache` | ~113 G | Premium SSD | HuggingFace cache for vLLM. Holds `openai/gpt-oss-120b` MXFP4 weights. Persists across daily deallocate. |
+| `/var/lib/docker/overlay2` | ~30 G | Premium SSD | Container layers (now includes vllm/vllm-openai:latest, ~11 G) |
+| `/var/lib/docker/containers` | ~150 M | Premium SSD | Container metadata / json-file logs |
 | `/root/qdrant_storage` | ~12 G | Premium SSD | Qdrant collections — **stays on Premium SSD; do NOT move to ephemeral NVMe** |
 | `/home/gpu` | 36 G | Premium SSD | |
-| `/home/gravity` | 13 G | Premium SSD | Wrapper build contexts, `start_containers.sh`, Qdrant tarballs, `ollama/docker-run.sh` |
+| `/home/gravity` | ~13 G | Premium SSD | Wrapper build contexts, `start_containers.sh`, Qdrant tarballs, `ollama/docker-run.sh`, `vllm/docker-run.sh`, `saved-modelfiles/` |
 | `/home/gourav` | 24 K | Premium SSD | |
 | `/data` (`/dev/sda`) | empty | Premium SSD | 512 GB managed disk, unused |
 | `/mnt` (`/dev/sdc`) | empty | ephemeral | 128 GB Azure resource disk |
@@ -351,9 +431,14 @@ ollama-wrapper/docker-run.sh          recreate script (replaces old parameterise
 ollama-wrapper/docker-run.sh.original old parameterised script preserved for reference
 embedding-wrapper/docker-run.sh       recreate script (replaces old parameterised version)
 embedding-wrapper/docker-run.sh.original old parameterised script preserved for reference
+vllm/docker-run.sh                    recreate script for vllm_gpt_oss (added 2026-05-19)
+vllm/docker-run.log                   log written by vllm/docker-run.sh
+hf-cache/                             HuggingFace cache (~113 GB; openai/gpt-oss-120b lives here)
+hf-cache/.hf_token                    HF Hub auth token (chmod 600)
+saved-modelfiles/                     Modelfiles preserved before model deletion (phi4_compliance, gpt-oss-120b)
 qdrant_data.tar     12 940 216 320 B  Qdrant data backup (2026-04-09)
 qdrant_image.tar       180 882 432 B  Qdrant image tarball (2026-04-09)
-start_containers.sh           2 054 B Boot-time safety net + warmup (see §11)
+start_containers.sh                   Boot-time safety net + warmup (see §11)
 start_containers.sh.original     881 B Old boot script preserved for reference
 docker_startup.log                    Log written by start_containers.sh
 ```
@@ -374,6 +459,7 @@ Docker's `--restart unless-stopped` policy on all four containers** (changed
 | `qdrant` | `/home/gravity/qdrant/docker-run.sh` | Refuses to start if `/root/qdrant_storage` is missing. API key inline (move to secret store later). |
 | `ollama_wrapper` | `/home/gravity/ollama-wrapper/docker-run.sh` | Old parameterised script preserved at `docker-run.sh.original`. |
 | `gravity-embedding-wrapper` | `/home/gravity/embedding-wrapper/docker-run.sh` | Preserves the `pip install + runserver` cmd. Old script at `docker-run.sh.original`. |
+| `vllm_gpt_oss` | `/home/gravity/vllm/docker-run.sh` | Added 2026-05-19. Reads HF token from `/home/gravity/hf-cache/.hf_token`. Bind-mounts HF cache from Premium SSD. Port 8001 → container 8000. Image: `vllm/vllm-openai:latest` (v0.21.0). `--gpu-memory-utilization 0.85 --max-model-len 32768 --max-num-batched-tokens 1024`. |
 
 Each script is idempotent — `docker rm -f` the existing container first, then
 `docker run` a fresh one with the canonical env vars, mounts, and
@@ -400,17 +486,22 @@ The current script runs four phases on every boot:
 
 **Phase 3 — Ensure ollama is running.** Phase 1 may have stopped it for the restore. Phase 3 brings it back.
 
-**Phase 4 — Warm `mistral:instruct`** so the first user request doesn't eat the cold-load cost.
+**Phase 4 — Warm core models.** Updated 2026-05-19 to warm both:
+- `gpt-oss:120b` on vLLM (port 8001) — includes a wait loop polling `/v1/models` for up to 5 min, since vLLM cold-start is 2-5 minutes after a deallocate.
+- `mistral:instruct` on Ollama (via wrapper at port 11434) — the fast-chat default.
+This eliminates first-request cold-load latency for both the heavy model (gpt-oss via vLLM) and the chat default (mistral via Ollama).
 
 Both the first-version (safety-net only) and the previous-original
 (parameterised `docker start` loop) are preserved as
 `start_containers.sh.bak.<timestamp>` and `start_containers.sh.original`.
 
 This means:
-- **Normal in-OS reboot** (rare) → disks survive, containers auto-start, script logs "healthy" and warms mistral.
-- **Daily Stop(deallocate)/Start** (every morning) → NVMe is blank; script reformats, mounts, rsyncs 112 GB from Premium SSD rollback, starts ollama, warms mistral. Total ~7–10 min, fully automated.
-- **Container missing** → safety net rebuilds it from its `docker-run.sh`.
-- **Full VM rebuild** → run `start_containers.sh` manually after attaching the Premium SSD (which holds the rollback).
+- **Normal in-OS reboot** (rare) → disks survive, containers auto-start, script logs "healthy" and warms both vLLM gpt-oss and mistral.
+- **Daily Stop(deallocate)/Start** (every morning) → NVMe is blank; script reformats, mounts, rsyncs 24 GB from Premium SSD rollback, starts ollama, waits for vLLM, warms gpt-oss-120b on vLLM, warms mistral on Ollama. **Total ~9-10 min, fully automated.** Measured 2026-05-20: 9:22 end-to-end (boot 05:57:02 → finished 06:06:24).
+- **Container missing** → safety net rebuilds it from its `docker-run.sh` (5 containers in scope: ollama, qdrant, ollama_wrapper, gravity-embedding-wrapper, vllm_gpt_oss).
+- **Full VM rebuild** → run `start_containers.sh` manually after attaching the Premium SSD (which holds the rollback) and re-creating `/home/gravity/hf-cache/.hf_token`.
+
+**Production validation status (2026-05-20)**: three full Stop(deallocate)/Start cycles completed since 2026-05-18 with the auto-restore in place. All cycles: vLLM RestartCount=0 (no crashes), 6 Ollama models restored from rollback, mistral warmed, gpt-oss accessible via vLLM with real responses. The hybrid Ollama + vLLM stack is **production-validated** across the daily deallocate cycle.
 
 ### Persistent vs ephemeral storage — the rule
 
